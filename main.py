@@ -49,65 +49,81 @@ def limparFantasmas(estado, uplinksData):
         logging.info(f"Removendo loja inexistente do monitoramento: {chave}")
 
 def verificarLoja(device, lojasMap, client, estado):
-    netId = device.get('networkId')
-    if netId not in lojasMap: return
+    try:
+        netId = device.get('networkId')
+        if netId not in lojasMap: return
 
-    nomeLoja = lojasMap[netId]
-    serial = device.get('serial')
-    uplinks = device.get('uplinks', [])
+        nomeLoja = lojasMap[netId]
+        serial = device.get('serial')
+        uplinks = device.get('uplinks', [])
 
-    for link in uplinks:
-        interface = link['interface']
-        status = link['status']
-        motivoAlerta = None
-        tipoAlerta = None
+        for link in uplinks:
+            interface = link['interface']
+            status = link['status']
+            motivoAlerta = None
+            tipoAlerta = None
 
-        if status == 'not connected':
-            motivoAlerta = f'Problema fisico na {interface}.'
-            tipoAlerta = "FISICO"
-        elif status == 'failed':
-            motivoAlerta = f'Problema logico na {interface}.'
-            tipoAlerta = "LOGICO"
-        elif status == 'active':
-            try:
-                historico = client.getLatencyHistory(serial)
-                if historico and historico[-1].get('latencyMs', 0) > 60:
-                    latencia = historico[-1]['latencyMs']
-                    motivoAlerta = f"Alta latencia na {interface}: {latencia}ms"
-                    tipoAlerta = "LATENCIA"
-            except: pass
+            if status == 'failed':
+                motivoAlerta = f'Problema logico na {interface}.'
+                tipoAlerta = "LOGICO"
+            elif status == 'active':
+                historico = None
+                # Sistema de retentativa para evitar erro de TimeOut da Meraki
+                for tentativa in range(3):
+                    try:
+                        historico = client.getLatencyHistory(serial)
+                        break
+                    except Exception as e:
+                        if tentativa < 2:
+                            time.sleep(2)
+                        else:
+                            logging.error(f"[FALHA API] Esgotadas as 3 tentativas de latencia para {nomeLoja}: {e}")
 
-        chaveAlerta = f"{nomeLoja} | {interface} | {tipoAlerta}"
-        agora = datetime.now()
+                if historico and len(historico) > 0:
+                    latencia = historico[-1].get('latencyMs')
+                    if latencia is not None and latencia > 60:
+                        motivoAlerta = f"Alta latencia na {interface}: {latencia}ms"
+                        tipoAlerta = "LATENCIA"
 
-        if motivoAlerta:
-            if chaveAlerta not in estado:
-                estado[chaveAlerta] = {
-                    "inicio_falha": agora.isoformat(),
-                    "email_enviado": False,
-                    "serial": serial
-                }
-                logging.warning(f"{nomeLoja} ({interface}) com erro. Aguardando persistencia de 30min.")
-            else:
-                inicio = datetime.fromisoformat(estado[chaveAlerta]["inicio_falha"])
-                tempo_decorrido = agora - inicio
+            chaveAlerta = f"{nomeLoja} | {interface} | {tipoAlerta}"
+            agora = datetime.now()
 
-                if tempo_decorrido > timedelta(minutes=30) and not estado[chaveAlerta]["email_enviado"]:
-                    alertaEmail(nomeLoja, motivoAlerta, serial, tipoAlerta)
-                    estado[chaveAlerta]["email_enviado"] = True
-        
-        else:
-            chaves_relacionadas = [c for c in estado if f"{nomeLoja} | {interface}" in c]
-            
-            for c in chaves_relacionadas:
-                if not estado[c]["email_enviado"]:
-                    del estado[c]
-                    logging.info(f"{nomeLoja} ({interface}) estabilizou antes dos 30min. Removida da fila.")
+            if motivoAlerta:
+                if chaveAlerta not in estado:
+                    estado[chaveAlerta] = {
+                        "inicio_falha": agora.isoformat(),
+                        "email_enviado": False,
+                        "serial": serial
+                    }
+                    logging.warning(f"{nomeLoja} ({interface}) com erro. Aguardando persistencia de 30min.")
                 else:
-                    inicio = datetime.fromisoformat(estado[c]["inicio_falha"])
-                    if agora - inicio > timedelta(hours=6):
+                    inicio = datetime.fromisoformat(estado[chaveAlerta]["inicio_falha"])
+                    tempo_decorrido = agora - inicio
+
+                    if tempo_decorrido > timedelta(minutes=30) and not estado[chaveAlerta]["email_enviado"]:
+                        alertaEmail(nomeLoja, motivoAlerta, serial, tipoAlerta)
+                        estado[chaveAlerta]["email_enviado"] = True
+            
+            else:
+                chaves_relacionadas = [c for c in estado if f"{nomeLoja} | {interface}" in c]
+                
+                for c in chaves_relacionadas:
+                    if not estado[c]["email_enviado"]:
                         del estado[c]
-                        logging.info(f"{nomeLoja} ({interface}) cumpriu as 6h de carencia e foi limpa.")
+                        logging.info(f"{nomeLoja} ({interface}) estabilizou antes dos 30min. Removida da fila.")
+                    else:
+                        inicio = datetime.fromisoformat(estado[c]["inicio_falha"])
+                        tempo_decorrido = agora - inicio
+                        
+                        if tempo_decorrido > timedelta(hours=6):
+                            del estado[c]
+                            logging.info(f"{nomeLoja} ({interface}) cumpriu a carencia ({tempo_decorrido}) e foi LIMPA do estado.")
+                        else:
+                            # Mudado para debug para não poluir os logs continuamente
+                            logging.debug(f"{nomeLoja} ({interface}) esta OK, aguardando carencia de 6h. Passaram {tempo_decorrido}.")
+
+    except Exception as e:
+        logging.error(f"[ERRO CRITICO] Falha inesperada na loja {device.get('serial')}: {e}")
 
 def rodar_monitoramento():
     logging.info("Iniciando ciclo de monitoramento.")
@@ -118,7 +134,8 @@ def rodar_monitoramento():
     lojasMap = {n['id']: n['name'] for n in networks if 'loja' in n['name'].lower()}
     uplinksData = client.getUplinks()
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # Reduzido para 5 workers para evitar block da API da Meraki
+    with ThreadPoolExecutor(max_workers=5) as executor:
         for device in uplinksData:
             executor.submit(verificarLoja, device, lojasMap, client, estado)
     
@@ -132,7 +149,7 @@ if __name__ == "__main__":
             try:
                 rodar_monitoramento()
             except Exception as e:
-                logging.error(f"Erro critico no loop: {e}")
+                logging.error(f"[ERRO LOOP] Falha no ciclo principal: {e}")
             
             logging.info("Aguardando 5 minutos para a proxima verificacao...")
             time.sleep(300)
